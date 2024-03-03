@@ -22,11 +22,18 @@ type Balance struct {
 	Total int `json:"saldo"`
 	Limit int `json:"limite"`
 }
-
 type CreateTransactionInput struct {
-	Value       int    `json:"valor" binding:"required"`
-	Type        string `json:"tipo" binding:"required"`
-	Description string `json:"descricao" binding:"required"`
+	Value       uint   `json:"valor" binding:"required"`
+	Type        string `json:"tipo" binding:"required,oneof=c d"`
+	Description string `json:"descricao" binding:"required,min=1,max=10"`
+}
+
+func (c *CreateTransactionInput) GetValue() int {
+	if c.Type == "c" {
+		return int(c.Value)
+	}
+
+	return int(c.Value) * -1
 }
 
 type ExtractTransaction struct {
@@ -105,7 +112,7 @@ func (r *RinhaDB) CreateTransaction(id string, newTransaction CreateTransactionI
 	err = tx.QueryRow(
 		context.Background(),
 		"UPDATE accounts SET saldo = saldo + $1 WHERE id = $2 AND (saldo + $1) > ~limite RETURNING limite, saldo",
-		newTransaction.Value,
+		newTransaction.GetValue(),
 		id).Scan(&balance.Limit, &balance.Total)
 	if err != nil {
 		if err.Error() == "no rows in result set" {
@@ -130,7 +137,6 @@ func (r *RinhaDB) CreateTransaction(id string, newTransaction CreateTransactionI
 
 func (r *RinhaDB) GetExtract(id int) (*Extract, *RinhaError) {
 	balance := ExtractBalance{Date: time.Now()}
-	lastTransactions := []ExtractTransaction{}
 
 	err := r.db.QueryRow(context.Background(), "SELECT saldo, limite FROM accounts WHERE id = $1", id).Scan(&balance.Total, &balance.Limit)
 	if err != nil {
@@ -144,12 +150,14 @@ func (r *RinhaDB) GetExtract(id int) (*Extract, *RinhaError) {
 
 	defer rows.Close()
 
+	lastTransactions := []ExtractTransaction{}
 	for rows.Next() {
 		var transaction ExtractTransaction
 		err = rows.Scan(&transaction.Value, &transaction.Type, &transaction.Description, &transaction.Date)
 		if err != nil {
 			return nil, NewRinhaServerError(err)
 		}
+		lastTransactions = append(lastTransactions, transaction)
 	}
 
 	extract := Extract{
