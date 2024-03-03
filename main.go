@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var db = make(map[string]string)
@@ -60,8 +61,40 @@ func NewRinhaError(error error, message string, statusCode int) *RinhaError {
 	return &RinhaError{Message: message, StatusCode: statusCode}
 }
 
-func createTransaction(conn *pgx.Conn, id string, newTransaction CreateTransactionInput) (*Balance, *RinhaError) {
-	tx, err := conn.Begin(context.Background())
+type RinhaDB struct {
+	db *pgxpool.Pool
+}
+
+func NewRinhaDB() (*RinhaDB, error) {
+	// connStr := "host=localhost port=5432 user=postgres password=postgres dbname=rinhadb sslmode=disable"
+	connStr := "host=db port=5432 user=postgres password=postgres dbname=postgres sslmode=disable"
+	poolCfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	poolCfg.MaxConns = 75
+	poolCfg.MinConns = 5
+	db, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err = db.Ping(context.Background())
+		if err == nil {
+			log.Println("Database connected")
+			break
+		}
+		log.Println("database connection error:", err.Error())
+		log.Println("retrying in 2 seconds")
+		time.Sleep(2 * time.Second)
+	}
+
+	return &RinhaDB{db: db}, nil
+}
+
+func (r *RinhaDB) CreateTransaction(id string, newTransaction CreateTransactionInput) (*Balance, *RinhaError) {
+	tx, err := r.db.Begin(context.Background())
 	if err != nil {
 		return nil, NewRinhaServerError(err)
 	}
@@ -71,7 +104,7 @@ func createTransaction(conn *pgx.Conn, id string, newTransaction CreateTransacti
 
 	err = tx.QueryRow(
 		context.Background(),
-		"UPDATE accounts SET saldo = saldo - $1 WHERE id = $2 AND (saldo - $1) > ~limite RETURNING limite, saldo",
+		"UPDATE accounts SET saldo = saldo + $1 WHERE id = $2 AND (saldo + $1) > ~limite RETURNING limite, saldo",
 		newTransaction.Value,
 		id).Scan(&balance.Limit, &balance.Total)
 	if err != nil {
@@ -95,7 +128,39 @@ func createTransaction(conn *pgx.Conn, id string, newTransaction CreateTransacti
 	return balance, nil
 }
 
-func setupRouter(conn *pgx.Conn) *gin.Engine {
+func (r *RinhaDB) GetExtract(id int) (*Extract, *RinhaError) {
+	balance := ExtractBalance{Date: time.Now()}
+	lastTransactions := []ExtractTransaction{}
+
+	err := r.db.QueryRow(context.Background(), "SELECT saldo, limite FROM accounts WHERE id = $1", id).Scan(&balance.Total, &balance.Limit)
+	if err != nil {
+		return nil, NewRinhaServerError(err)
+	}
+
+	rows, err := r.db.Query(context.Background(), "SELECT valor, tipo, descricao, realizada_em FROM transactions WHERE account_id = $1 ORDER BY realizada_em DESC LIMIT 10", id)
+	if err != nil {
+		return nil, NewRinhaServerError(err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var transaction ExtractTransaction
+		err = rows.Scan(&transaction.Value, &transaction.Type, &transaction.Description, &transaction.Date)
+		if err != nil {
+			return nil, NewRinhaServerError(err)
+		}
+	}
+
+	extract := Extract{
+		Balance:          balance,
+		LastTransactions: lastTransactions,
+	}
+
+	return &extract, nil
+}
+
+func setupRouter(db *RinhaDB) *gin.Engine {
 	r := gin.Default()
 
 	r.GET("/clientes/:id/extrato", func(c *gin.Context) {
@@ -111,37 +176,10 @@ func setupRouter(conn *pgx.Conn) *gin.Engine {
 			return
 		}
 
-		balance := ExtractBalance{Date: time.Now()}
-		lastTransactions := []ExtractTransaction{}
-
-		err := conn.QueryRow(context.Background(), "SELECT saldo, limite FROM accounts WHERE id = $1", params.ID).Scan(&balance.Total, &balance.Limit)
+		extract, err := db.GetExtract(params.ID)
 		if err != nil {
-			fmt.Println("query", err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "query"})
+			c.AbortWithStatusJSON(err.StatusCode, gin.H{"message": err.Message})
 			return
-		}
-
-		rows, err := conn.Query(context.Background(), "SELECT valor, tipo, descricao, realizada_em FROM transactions WHERE account_id = $1 ORDER BY realizada_em DESC LIMIT 10", params.ID)
-		if err != nil {
-			fmt.Println("query", err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "query"})
-			return
-		}
-
-		defer rows.Close()
-
-		for rows.Next() {
-			var transaction ExtractTransaction
-			err = rows.Scan(&transaction.Value, &transaction.Type, &transaction.Description, &transaction.Date)
-			if err != nil {
-				fmt.Println("scan", err)
-				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "scan"})
-			}
-		}
-
-		extract := Extract{
-			Balance:          balance,
-			LastTransactions: lastTransactions,
 		}
 
 		c.JSON(http.StatusOK, extract)
@@ -160,7 +198,7 @@ func setupRouter(conn *pgx.Conn) *gin.Engine {
 			return
 		}
 
-		balance, err := createTransaction(conn, id, newTransaction)
+		balance, err := db.CreateTransaction(id, newTransaction)
 		if err != nil {
 			fmt.Println("createTransaction", err)
 			c.AbortWithStatusJSON(err.StatusCode, gin.H{"message": err.Message})
@@ -181,15 +219,12 @@ func getEnv(key, fallback string) string {
 }
 
 func main() {
-	databaseUrl := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/postgres")
-	conn, err := pgx.Connect(context.Background(), databaseUrl)
+	db, err := NewRinhaDB()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 
-	defer conn.Close(context.Background())
-
-	r := setupRouter(conn)
+	r := setupRouter(db)
 	r.Run()
 }
