@@ -18,7 +18,7 @@ type RinhaParams struct {
 }
 
 type Balance struct {
-	Total int `json:"total"`
+	Total int `json:"saldo"`
 	Limit int `json:"limite"`
 }
 
@@ -46,6 +46,55 @@ type Extract struct {
 	LastTransactions []ExtractTransaction `json:"ultimas_transacoes"`
 }
 
+type RinhaError struct {
+	Message    string `json:"message"`
+	StatusCode int    `json:"status_code"`
+	Error      error
+}
+
+func NewRinhaServerError(err error) *RinhaError {
+	return &RinhaError{Error: err, Message: "Internal Server Error", StatusCode: 500}
+}
+
+func NewRinhaError(error error, message string, statusCode int) *RinhaError {
+	return &RinhaError{Message: message, StatusCode: statusCode}
+}
+
+func createTransaction(conn *pgx.Conn, id string, newTransaction CreateTransactionInput) (*Balance, *RinhaError) {
+	tx, err := conn.Begin(context.Background())
+	if err != nil {
+		return nil, NewRinhaServerError(err)
+	}
+
+	defer tx.Rollback(context.Background())
+	balance := &Balance{}
+
+	err = tx.QueryRow(
+		context.Background(),
+		"UPDATE accounts SET saldo = saldo - $1 WHERE id = $2 AND (saldo - $1) > ~limite RETURNING limite, saldo",
+		newTransaction.Value,
+		id).Scan(&balance.Limit, &balance.Total)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, NewRinhaError(err, "Saldo insuficiente", http.StatusUnprocessableEntity)
+		}
+
+		return nil, NewRinhaServerError(err)
+	}
+
+	_, err = tx.Exec(context.Background(), "INSERT INTO transactions (valor, tipo, descricao, account_id) VALUES ($1, $2, $3, $4)", newTransaction.Value, newTransaction.Type, newTransaction.Description, id)
+	if err != nil {
+		return nil, NewRinhaServerError(err)
+	}
+
+	err = tx.Commit(context.Background())
+	if err != nil {
+		return nil, NewRinhaServerError(err)
+	}
+
+	return balance, nil
+}
+
 func setupRouter(conn *pgx.Conn) *gin.Engine {
 	r := gin.Default()
 
@@ -62,20 +111,37 @@ func setupRouter(conn *pgx.Conn) *gin.Engine {
 			return
 		}
 
+		balance := ExtractBalance{Date: time.Now()}
+		lastTransactions := []ExtractTransaction{}
+
+		err := conn.QueryRow(context.Background(), "SELECT saldo, limite FROM accounts WHERE id = $1", params.ID).Scan(&balance.Total, &balance.Limit)
+		if err != nil {
+			fmt.Println("query", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "query"})
+			return
+		}
+
+		rows, err := conn.Query(context.Background(), "SELECT valor, tipo, descricao, realizada_em FROM transactions WHERE account_id = $1 ORDER BY realizada_em DESC LIMIT 10", params.ID)
+		if err != nil {
+			fmt.Println("query", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "query"})
+			return
+		}
+
+		defer rows.Close()
+
+		for rows.Next() {
+			var transaction ExtractTransaction
+			err = rows.Scan(&transaction.Value, &transaction.Type, &transaction.Description, &transaction.Date)
+			if err != nil {
+				fmt.Println("scan", err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "scan"})
+			}
+		}
+
 		extract := Extract{
-			Balance: ExtractBalance{
-				Total: 100,
-				Limit: 1000,
-				Date:  time.Now(),
-			},
-			LastTransactions: []ExtractTransaction{
-				{
-					Value:       100,
-					Type:        "debito",
-					Description: "Compra de um produto",
-					Date:        time.Now(),
-				},
-			},
+			Balance:          balance,
+			LastTransactions: lastTransactions,
 		}
 
 		c.JSON(http.StatusOK, extract)
@@ -94,43 +160,10 @@ func setupRouter(conn *pgx.Conn) *gin.Engine {
 			return
 		}
 
-		fmt.Println(id, newTransaction)
-
-		tx, err := conn.Begin(context.Background())
+		balance, err := createTransaction(conn, id, newTransaction)
 		if err != nil {
-			fmt.Println("begin", err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "begin"})
-			return
-		}
-
-		defer tx.Rollback(context.Background())
-
-		balance := Balance{}
-
-		err = tx.QueryRow(
-			context.Background(),
-			"UPDATE accounts SET saldo = saldo - $1 WHERE id = $2 AND (saldo - $1) > ~limite RETURNING limite, saldo",
-			newTransaction.Value,
-			id).Scan(&balance.Limit, &balance.Total)
-		if err != nil {
-			if err.Error() == "no rows in result set" {
-				c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"message": "Saldo insuficiente"})
-				return
-			}
-
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "new-balance"})
-			return
-		}
-
-		_, err = tx.Exec(context.Background(), "INSERT INTO transactions (valor, tipo, descricao, account_id) VALUES ($1, $2, $3, $4)", newTransaction.Value, newTransaction.Type, newTransaction.Description, id)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "new-transaction"})
-			return
-		}
-
-		err = tx.Commit(context.Background())
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "Internal Server Error", "context": "commit"})
+			fmt.Println("createTransaction", err)
+			c.AbortWithStatusJSON(err.StatusCode, gin.H{"message": err.Message})
 			return
 		}
 
@@ -140,8 +173,15 @@ func setupRouter(conn *pgx.Conn) *gin.Engine {
 	return r
 }
 
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
 func main() {
-	databaseUrl := "postgres://postgres:postgres@localhost:5432/postgres"
+	databaseUrl := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/postgres")
 	conn, err := pgx.Connect(context.Background(), databaseUrl)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
@@ -151,5 +191,5 @@ func main() {
 	defer conn.Close(context.Background())
 
 	r := setupRouter(conn)
-	r.Run(":9999")
+	r.Run()
 }

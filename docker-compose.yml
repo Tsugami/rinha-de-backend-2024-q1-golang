@@ -27,8 +27,10 @@ services:
       
   app:
     build: . 
+    environment:
+     - DATABASE_URL=postgres://postgres:postgres@db:5432/postgres
     ports:
-     - 9999:9999
+     - 9999:8080
     depends_on:
       db:
         condition: service_healthy
